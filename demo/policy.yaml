@@ -1,0 +1,104 @@
+# Demo policy for a customer-support agent at a fictional company, Acme.
+# Company data stays in its own systems; the vault pulls only what's listed here.
+
+version: 1
+internal_domains: [acme.example]
+cache_ttl_seconds: 300
+
+sources:
+  crm.customer:
+    owner: customer_id          # each record belongs to one customer
+    owner_contact: email        # that customer's verified address on file
+    fields:
+      name: protected
+      email: protected
+      phone: protected
+      address: protected
+      plan: normal
+      card_number: secret       # never shown to the model
+
+  docs:
+    owner: company
+    key_levels:
+      refund_policy: normal     # fine to share with customers
+      pricing_sheet: protected  # internal only: acme.example addresses
+
+  inbox.ticket:
+    trust: untrusted            # anyone can email the support inbox
+    owner: company
+    default_level: normal
+
+tasks:
+  support_reply:
+    description: Answer one support ticket for the customer who sent it.
+    trusted: [customer_id]      # from the verified ticket sender, not the email body
+    reads:
+      crm.customer:
+        key: "{customer_id}"    # only this ticket's customer
+        fields: [name, email, plan, card_number]
+      docs:
+        keys: [refund_policy]
+    sinks:
+      email.send:
+        recipient_arg: to
+        allowed_recipients: ["crm.customer:{customer_id}.email"]
+        max_calls: 3
+      payments.refund:
+        args: [card, amount]
+        secrets_allowed: {card_number: card}
+        max_calls: 1
+
+  support_reply_planned:
+    description: Same task, run in planner mode with the ticket body available to a quarantined extractor.
+    trusted: [customer_id, ticket_id]
+    reads:
+      crm.customer:
+        key: "{customer_id}"
+        fields: [name, email, plan, card_number]
+      docs:
+        keys: [refund_policy]
+      inbox.ticket:
+        key: "{ticket_id}"
+        fields: [body]
+    sinks:
+      email.send:
+        recipient_arg: to
+        allowed_recipients: ["crm.customer:{customer_id}.email"]
+        max_calls: 3
+      payments.refund:
+        args: [card, amount]
+        secrets_allowed: {card_number: card}
+        max_calls: 1
+
+# Agent-facing tools (used by the MCP proxy and LLM adapters).
+tools:
+  get_customer:
+    read: crm.customer
+    key_arg: customer_id
+    description: Look up the customer who sent this ticket.
+  get_doc:
+    read: docs
+    key_arg: name
+    description: Read a help-centre document by name (e.g. refund_policy).
+  get_ticket:
+    read: inbox.ticket
+    key_arg: ticket_id
+    description: Read the current support ticket.
+  send_email:
+    act: email.send
+    description: Email the customer.
+    params: {to: string, subject: string, body: string}
+  refund:
+    act: payments.refund
+    description: Refund the customer's card. Pass the card placeholder exactly as given.
+    params: {card: string, amount: number}
+
+# When run as an MCP proxy, the vault reads and acts through these upstream tools.
+upstream:
+  sources:
+    crm.customer: {tool: get_customer, key_arg: customer_id}
+    docs: {tool: get_doc, key_arg: name}
+    inbox.ticket: {tool: get_ticket, key_arg: ticket_id}
+  sinks:
+    email.send: {tool: send_email}
+    payments.refund: {tool: refund}

@@ -1,0 +1,58 @@
+# taskvault policy: accounts-payable inbox agent.
+# The agent reads supplier invoices from an untrusted inbox and prepares payments.
+# Bank details come only from the supplier master record, never from an email.
+
+version: 1
+internal_domains: [yourcompany.com]
+cache_ttl_seconds: 120
+
+sources:
+  erp.supplier:
+    owner: supplier_id
+    owner_contact: remittance_email      # verified address on the supplier record
+    fields:
+      name: protected
+      remittance_email: protected
+      bank_account: secret               # the model never sees account numbers
+      payment_terms: normal
+
+  erp.invoice:
+    owner: supplier_id                   # an invoice belongs to its supplier...
+    owner_field: supplier_id             # ...named in this field
+    fields:
+      supplier_id: normal
+      number: normal
+      amount: protected
+      due_date: normal
+      status: normal
+
+  inbox.email:
+    trust: untrusted
+    owner: company
+    default_level: normal
+
+tasks:
+  process_invoice:
+    description: Match one invoice to its supplier and schedule payment to the account on file.
+    trusted: [supplier_id, invoice_id]   # from your ERP match, not from the email text
+    reads:
+      erp.supplier: {key: "{supplier_id}", fields: [name, remittance_email, bank_account, payment_terms]}
+      erp.invoice: {key: "{invoice_id}", fields: [number, amount, due_date, status, supplier_id]}
+    sinks:
+      payments.schedule:
+        args: [account, amount, reference]
+        secrets_allowed: {bank_account: account}   # the real account number is swapped in only here
+        approval: always
+        max_calls: 1
+      email.send:
+        recipient_arg: to
+        allowed_recipients: ["erp.supplier:{supplier_id}.remittance_email", "*@yourcompany.com"]
+        max_calls: 2
+
+tools:
+  get_supplier: {read: erp.supplier, key_arg: supplier_id, description: Look up the matched supplier.}
+  get_invoice: {read: erp.invoice, key_arg: invoice_id, description: Read the matched invoice.}
+  schedule_payment: {act: payments.schedule, description: "Schedule payment to the supplier's account on file.",
+                     params: {account: string, amount: number, reference: string}}
+  send_email: {act: email.send, description: Email the supplier or the finance team.,
+               params: {to: string, subject: string, body: string}}

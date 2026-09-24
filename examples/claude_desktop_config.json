@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "acme-support": {
+      "command": "taskvault",
+      "args": [
+        "serve",
+        "--policy", "/path/to/taskvault.yaml",
+        "--task", "support_reply",
+        "--trusted", "customer_id=12",
+        "--audit", "/path/to/audit.jsonl",
+        "--key", "/path/to/customer.key",
+        "--",
+        "python", "/path/to/your_crm_mcp_server.py"
+      ]
+    }
+  }
+}

@@ -1,0 +1,63 @@
+# taskvault policy: customer-support agent.
+# Company data stays in your systems; the vault pulls only what's listed here.
+# Docs: https://github.com/AgentP-Codes/Task-Vault-Name-is-bound-to-Change-/blob/main/docs/policy-reference.md
+
+version: 1
+internal_domains: [yourcompany.com]      # company data may only be emailed here
+cache_ttl_seconds: 300                   # how long fetched records stay in the encrypted cache
+
+sources:
+  crm.customer:
+    owner: customer_id                   # each record belongs to one customer...
+    owner_contact: email                 # ...whose verified address is this field
+    fields:
+      name: protected
+      email: protected
+      phone: protected
+      plan: normal
+      card_number: secret                # the model only ever sees a placeholder
+
+  docs:
+    owner: company
+    default_level: protected             # unlabelled documents are internal
+    key_levels:
+      refund_policy: normal              # public help-centre article
+
+  inbox.ticket:
+    trust: untrusted                     # anyone can write to the support inbox
+    owner: company
+    default_level: normal
+
+tasks:
+  support_reply:
+    description: Answer one support ticket for the customer who sent it.
+    trusted: [customer_id]               # set by your app from the verified sender
+    reads:
+      crm.customer: {key: "{customer_id}", fields: [name, email, plan, card_number]}
+      docs: {keys: [refund_policy], fields: [name, body]}
+    sinks:
+      email.send:
+        recipient_arg: to
+        allowed_recipients: ["crm.customer:{customer_id}.email"]
+        max_calls: 3
+      payments.refund:
+        args: [card, amount]
+        secrets_allowed: {card_number: card}
+        approval: always                 # a human approves every refund
+        max_calls: 1
+
+tools:
+  get_customer: {read: crm.customer, key_arg: customer_id, description: Look up the customer who sent this ticket.}
+  get_doc: {read: docs, key_arg: name, description: "Read a help-centre document by name."}
+  send_email: {act: email.send, description: Email the customer., params: {to: string, subject: string, body: string}}
+  refund: {act: payments.refund, description: "Refund the customer's card; pass the card placeholder unchanged.",
+           params: {card: string, amount: number}}
+
+# For `taskvault serve` (MCP proxy): which upstream MCP tools back each source and sink.
+upstream:
+  sources:
+    crm.customer: {tool: get_customer, key_arg: customer_id}
+    docs: {tool: get_doc, key_arg: name}
+  sinks:
+    email.send: {tool: send_email}
+    payments.refund: {tool: refund}
