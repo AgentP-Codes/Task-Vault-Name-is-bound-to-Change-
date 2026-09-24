@@ -1,0 +1,32 @@
+   name: ci
+
+   on:
+     push:
+       branches: [main]
+     pull_request:
+
+   jobs:
+     test:
+       runs-on: ubuntu-latest
+       strategy:
+         matrix:
+           python: ["3.10", "3.11", "3.12", "3.13"]
+       steps:
+         - uses: actions/checkout@v4
+         - uses: actions/setup-python@v5
+           with:
+             python-version: ${{ matrix.python }}
+         - run: pip install -e ".[dev]"
+         - name: Embedded Postgres for the database tests (skipped where unavailable)
+           run: pip install pgserver || echo "pgserver unavailable; Postgres tests will be skipped"
+         - run: ruff check .
+         - run: pytest -q
+         - run: pip install build && python -m build
+         - run: python -m demo
+         - run: python -m demo.bench
+         - name: Attack suite on the bundled templates
+           run: |
+             for t in support finance; do
+               mkdir -p /tmp/$t && taskvault init --template $t --dir /tmp/$t
+               taskvault test --policy /tmp/$t/taskvault.yaml --fixtures /tmp/$t/fixtures.yaml
+             done
