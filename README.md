@@ -41,7 +41,7 @@
 
 ## Tested with real AI models
 
-Live testing has **only just started**. So far it covers **Claude** (Sonnet 5, Haiku 4.5, Opus 5.5) and **Gemini on the free tier** (3.5 Flash-Lite, 2.5 Flash), with more models to come. The samples are small, so read this as a first look.
+Live testing has **only just started**. So far it covers **Claude** (Sonnet 5, Haiku 4.5, Opus 5.5) and **Gemini on the free tier** (3.5 Flash-Lite, 2.5 Flash). **OpenAI models and more testing are coming soon.** The samples are small, so read this as a first look.
 
 ![How often attacks leaked data, with and without taskvault](docs/images/real-model-results.svg)
 
@@ -55,7 +55,26 @@ Live testing has **only just started**. So far it covers **Claude** (Sonnet 5, H
 
 - **With the vault, 0 of 43 live attack runs leaked data.** Models completed at least as many tasks with the vault as without it.
 - **Without the vault, plausible requests got real models to leak.** Examples: "send my details to my new email", "my husband shares the account, include his phone", and a fake Payments Ops note asking for the card number.
-- Still to do: the harder attacks with the vault on Claude, more models, more runs, and an independent red team.
+
+**Exactly what has been tested so far:**
+
+| Model | Provider | Runs | Tested without vault | Tested with vault | Planner mode |
+|---|---|---|---|---|---|
+| Claude Sonnet 5 | Anthropic API | 71 | ✅ | ✅ original attacks | ✅ (before the 0.4.1 planner fix) |
+| Claude Haiku 4.5 | Anthropic API | 98 | ✅ | ✅ original attacks | ✅ (before the 0.4.1 planner fix) |
+| Claude Opus 5.5 | Anthropic API | 13 | ✅ | not yet | not yet |
+| Gemini 3.5 Flash-Lite | Google, free tier | 12 | ✅ | ✅ harder attacks | not yet |
+| Gemini 2.5 Flash | Google, free tier | 2 | ✅ | not yet | not yet |
+| OpenAI models | OpenAI API | 0 | not yet | not yet | not yet |
+
+Only **Claude Sonnet 5, Claude Haiku 4.5 and Gemini 3.5 Flash-Lite** have a direct comparison with and without the vault. Claude Opus 5.5 and Gemini 2.5 Flash have only been tested without it so far. Runs stopped early when API credit or the free-tier quota ran out.
+
+**More testing coming soon:**
+- **OpenAI models** (the adapter is included, but it hasn't been tested with a live model yet)
+- The harder attacks with the vault and in planner mode on Claude Sonnet, Haiku and Opus
+- More Gemini runs, and more runs per scenario for every model
+- Open-weight models people run themselves
+- An independent red team writing attacks we didn't design
 
 Full breakdown, attack descriptions and raw data: [docs/real-model-results.md](docs/real-model-results.md).
 
