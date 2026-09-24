@@ -9,7 +9,7 @@
 >
 > Provided "as is", without warranty of any kind, under the [Apache-2.0 licence](LICENSE). Its features describe design goals, not guarantees. Please read the full [Disclaimer](#disclaimer) before using it.
 
-**Status:** v0.4.1 beta · **ready for testing with real AI models** (adapters for Claude, Gemini and OpenAI) · Feedback, issues and ideas are very welcome.
+**Status:** v0.4.2 beta · **ready for testing with real AI models** (adapters for Claude, Gemini and OpenAI) · Feedback, issues and ideas are very welcome.
 
 **How this was built:** taskvault was designed and directed by @AgentP-Codes. Much of the code, tests and documentation were written with the help of Claude (Anthropic's AI). The live model tests were run by the project using its own API keys. All the code is open for review.
 
@@ -26,9 +26,54 @@
       agent  (your code, an MCP host, or any LLM)
 ```
 
+## What's new in 0.4.2
+
+A security and reliability update from a round of stress testing. Full details are in the [changelog](CHANGELOG.md).
+
+**Security fixes**
+- **Recipients must be exactly one plain address.** Before this fix, a hidden second address (`attacker@evil.example staff@yourcompany.com`) could get past "anyone at our company" rules.
+- **Your own tools can't leak secrets back to the AI.** Replies and error messages from sinks are masked before the agent sees them.
+- **`cc`, `bcc` and `reply_to` are checked** like the main recipient, and sinks receive the checked address.
+- **Damaged or forged placeholders are blocked**, and tool arguments are type-checked against the policy.
+- **No data values in logs or the audit file** (clears two code-scanning alerts).
+- **A policy typo can't mean "allow everyone":** lists written as plain text are rejected when the policy loads.
+- **`cryptography` 49 or later is required,** because older versions have known vulnerabilities.
+
+**Reliability fixes**
+- **Deposit boxes can't lose data under heavy use:** a race could replace a box's key, and SQLite could report "database is locked".
+- **Several processes can share one audit log** without it falsely looking tampered.
+- **The MCP proxy answers malformed messages** with an error instead of crashing.
+- **Clear errors for damaged policy and key files**, plus `taskvault audit repair` for a line left unfinished by a power cut.
+
+## How it was stress tested
+
+For 0.4.2, taskvault was stress tested with Claude Opus 5.5 (Anthropic's AI):
+
+- **About 15,000 generated attacks (fuzzing):**
+  - odd recipient formats, look-alike and invisible characters
+  - tampered placeholders
+  - random agent sessions
+  - thousands of damaged policy files
+- **Load:**
+  - 32 threads sharing one vault and audit log
+  - 10 MB messages
+  - 2,000 concurrent deposit-box writes, every one read back
+  - several separate processes writing one audit log
+  - a 100,000-row database scan
+- **Bad input:**
+  - 23 kinds of malformed MCP messages
+  - a simulated power cut mid-write
+  - damaged key and policy files
+- **Scanners:** code scanning (bandit), known-vulnerability checks on dependencies (pip-audit) and type checking (mypy)
+- **A second AI reviewer** (a separate Claude session) read parts of the code. Its first finding, the hidden second address, is fixed above
+
+Every problem found is fixed and has a test so it can't come back: 231 tests on Python 3.10–3.13. Run the stress test yourself with `python -m demo.stress`. On a laptop, taskvault added about 0.2 ms per task.
+
+**This is still not an independent security review.** The testing was done by the project, with AI assistance, against attacks we designed. taskvault is **not recommended for live production agents handling real customer data** until it has been independently reviewed.
+
 ## What you can do with it
 
-- **Protect an AI agent you already have.** Put taskvault between your agent and its tools with the MCP proxy, with no code changes, or add it to a new agent with a few lines of Python.
+- **Protect an AI agent you already have.** Put taskvault between your agent and its tools with the MCP proxy (no changes to your agent's code, just its settings), or add it to a new agent with a few lines of Python.
 - **Scan your data and get a starter setup automatically.** `taskvault setup` finds sensitive data in your database or files (cards, emails, phone numbers, tax file numbers, API keys and more) and writes a policy you can review.
 - **Give each task only the data it needs.** The agent sees one customer's record for one ticket, not the whole database.
 - **Hide personal details and secrets from the AI.** Names and emails become stand-ins, and card numbers become placeholders. Real values are swapped back only at approved destinations.
@@ -37,7 +82,7 @@
 - **Try it safely first.** Shadow mode records what taskvault *would* have blocked, without blocking anything.
 - **Require a human to approve risky actions,** like refunds, and get flagged when an agent does something unusual.
 - **Keep a tamper-evident record** of everything the agent read and did, for audits and investigations.
-- **Test it against prompt-injection attacks with your own AI model and API key** (see below).
+- **Test it against prompt-injection attacks with your own AI model:** tested so far with Claude and Gemini. OpenAI support is included but not yet tested live (see below).
 
 ## Tested with real AI models
 
@@ -188,7 +233,8 @@ git clone https://github.com/AgentP-Codes/Task-Vault-Name-is-bound-to-Change- &&
 pip install -e ".[dev]"
 python -m demo          # a hijacked support agent, with and without the vault
 python -m demo.bench    # 11 tickets x 3 configurations (scripted model)
-pytest                  # 166 tests
+pytest                  # 231 tests
+python -m demo.stress   # stress test (about a minute; --quick for a few seconds)
 ```
 
 ```
@@ -235,7 +281,7 @@ To be clear about what's been proven and what hasn't:
 
 | Part | Status |
 | --- | --- |
-| Vault core, planner, encryption, secret store, deposit boxes, pseudonyms, setup scanner, CLI, MCP proxy | Real code, tested (166 tests on Python 3.10-3.13) |
+| Vault core, planner, encryption, secret store, deposit boxes, pseudonyms, setup scanner, CLI, MCP proxy | Real code, tested (231 tests on Python 3.10-3.13, plus fuzzing and a stress test) |
 | SQLite and Postgres (deposit boxes, setup scanner, SQL connector) | Real code, **tested against real SQLite and a real Postgres 16 server** |
 | Demo company (Acme), its customers, tickets and documents | **Simulated**: invented data |
 | "Hijacked" and "gullible" agents in the demo and benchmark | **Simulated**: scripted stand-ins for an LLM that obeys every injection |
@@ -262,7 +308,7 @@ To be clear about what's been proven and what hasn't:
 | `taskvault boxes holder\|put\|list\|log\|forget` | Deposit boxes for departments, customers and client companies |
 | `taskvault replay <trace> --agent mod:fn --remove "text"` | Rerun a recorded session without suspect text |
 | `taskvault traces list\|pin\|purge` | Manage recorded sessions |
-| `taskvault audit verify\|show` | Check or read an audit log |
+| `taskvault audit verify\|show\|repair` | Check or read an audit log; `repair` sets aside a line left unfinished by a crash |
 | `taskvault keys init\|shred` | Create or destroy a local customer key |
 
 ## Documentation
@@ -277,20 +323,11 @@ To be clear about what's been proven and what hasn't:
 - **Tool mode matches values.** Heavily reworded or encoded data can reach a recipient the task already allows. Planner mode closes this.
 - **Your app must supply trusted inputs honestly.** If "which customer is this?" comes from the email text, the protections don't hold.
 - **Setup is a draft.** Review what it wrote, especially low-confidence fields listed in `setup-report.md`.
-- **Not yet independently audited.**
+- **Not yet independently audited.** The 0.4.2 stress testing was done by the project with AI assistance, not by an independent reviewer.
 - **Test results are limited.** The benchmark attacks were written by the project itself and the live samples are small. Passing them doesn't mean taskvault stops every attack, and new attack techniques appear all the time.
 - **It's one layer, not a complete security system.** It doesn't replace access controls, network security, monitoring, staff training or your AI provider's own safeguards.
 - **Bugs are possible,** including ones that could let data through. Keep backups, and don't make it your only protection.
 - **Tested mainly on Linux.** The automated tests run on Linux. Windows and macOS have only had basic use so far.
-
-## Roadmap
-
-- [ ] Web UI: dashboard, policy editor, setup wizard, box manager
-- [ ] Streamable HTTP transport for the MCP proxy
-- [x] First live-model benchmark results (Claude, Gemini)
-- [ ] More models, more runs, and AgentDojo numbers
-- [ ] More connectors (HubSpot, Zendesk, Jira, Gmail, Slack)
-- [ ] Third-party security review
 
 ## Background
 

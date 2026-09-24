@@ -56,7 +56,14 @@ class LocalKeyProvider:
     def data_key(self) -> bytes:
         if not self.path.exists():
             raise KeyError_("key has been destroyed; stored data is unreadable")
-        return base64.b64decode(self.path.read_bytes())
+        try:
+            key = base64.b64decode(self.path.read_bytes().strip(), validate=True)
+        except (ValueError, OSError) as e:
+            raise KeyError_(f"{self.path} isn't a valid taskvault key file (it may be damaged or the wrong "
+                            f"file); restore it from your backup") from e
+        if len(key) != 32:
+            raise KeyError_(f"{self.path} isn't a valid taskvault key file (wrong length); restore it from your backup")
+        return key
 
     def shred(self) -> None:
         """Destroy the key. Everything encrypted under it becomes unreadable."""

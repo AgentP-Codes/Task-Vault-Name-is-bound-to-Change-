@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.2
+
+Security and reliability fixes from a round of stress testing (with Claude Opus 5.5). Not an independent review.
+
+**Security**
+- Recipients must be exactly one plain address or id: a hidden second address could get past a glob rule like `*@yourcompany.com`
+- Sink replies and error messages are masked (real values replaced with the placeholder or stand-in the agent saw); sink errors are raised as `SinkError`
+- `cc` / `bcc` / `reply_to` / `recipients` arguments are checked like the main recipient; sinks receive the checked address
+- Damaged or forged placeholders are blocked; tool arguments are type-checked against the policy's `params`
+- Block reasons written to logs and the audit file contain no data values; agent-chosen names are fingerprinted
+- List settings in policies must be lists (a string like `"*@acme.example"` was read as characters, including `*`); wrong shapes raise `PolicyError`
+- A failure unlocking a stored secret is a logged block
+- Requires `cryptography>=49` (older versions have known vulnerabilities)
+- REST connector: only http(s) URLs; keys can't be `.` or `..`
+
+**Reliability**
+- Deposit boxes: a race could replace a box's data key (making earlier items unreadable); SQLite waits instead of failing with "database is locked"; Postgres setup is serialised
+- Audit log: an OS-level file lock and chaining from the file's real last entry, so several processes can share one file; `taskvault audit repair` sets aside a torn last line
+- MCP proxy: malformed JSON-RPC gets an error reply instead of crashing the proxy
+- Clear errors for damaged key files and policies of the wrong shape
+- Linter warns when a sink with a recipient has no `args` list; templates and demo policy now list them
+
+**Testing**
+- Fuzz tests (`tests/test_fuzz.py`, needs `hypothesis`), hardening tests, MCP proxy fuzz tests, multi-process audit test, concurrent deposit-box test
+- `python -m demo.stress`: throughput, 32-thread and multi-writer checks, 10 MB inputs, 100,000-row setup scan
+- Fixed a test that failed at random (short digit strings matching random hex)
+- 231 tests
+
 ## 0.4.1
 
 - First tests with live models (Claude Sonnet 5, Haiku 4.5, Opus 5.5; Gemini 3.5 Flash-Lite and 2.5 Flash on the free tier): with the vault, 0 of 43 attack runs leaked; without it, realistic attacks leaked data on several models. Chart, table and raw data in `docs/real-model-results.md`

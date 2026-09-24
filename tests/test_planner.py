@@ -44,7 +44,7 @@ def test_extractor_never_sees_secrets():
     plan = [{"id": "cust", "read": "crm.customer"},
             {"id": "x", "extract": {"from": ["cust.card_number"], "instruction": "?", "schema": {"amount": "number"}}}]
     Planner(planned_task(World()), spy).run(plan)
-    assert "4111" not in str(seen)
+    assert "4111 1111 1111 1111" not in str(seen)
 
 
 def test_recipient_derived_from_untrusted_content_is_blocked_even_if_it_looks_valid():

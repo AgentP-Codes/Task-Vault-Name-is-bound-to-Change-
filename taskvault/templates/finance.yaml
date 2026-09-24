@@ -46,6 +46,7 @@ tasks:
         max_calls: 1
       email.send:
         recipient_arg: to
+        args: [to, subject, body]      # anything else (cc, bcc...) is blocked
         allowed_recipients: ["erp.supplier:{supplier_id}.remittance_email", "*@yourcompany.com"]
         max_calls: 2
 

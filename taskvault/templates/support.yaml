@@ -38,6 +38,7 @@ tasks:
     sinks:
       email.send:
         recipient_arg: to
+        args: [to, subject, body]      # anything else (cc, bcc...) is blocked
         allowed_recipients: ["crm.customer:{customer_id}.email"]
         max_calls: 3
       payments.refund:

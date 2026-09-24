@@ -188,13 +188,17 @@ class BoxDB:
             import psycopg  # optional: pip install "taskvault[postgres]"
             self.dialect = "postgres"
             self.conn = psycopg.connect(url, autocommit=True)
+            self.conn.execute("SELECT pg_advisory_lock(7428101)")   # one connection creates the tables at a time
         else:
             path = url[len("sqlite:///"):] if url.startswith("sqlite:///") else url
             self.dialect = "sqlite"
             target = ":memory:" if path == ":memory:" else str(private_file(Path(path).resolve()))
-            self.conn = sqlite3.connect(target, check_same_thread=False, isolation_level=None)
+            self.conn = sqlite3.connect(target, check_same_thread=False, isolation_level=None, timeout=30)
+            self.conn.execute("PRAGMA busy_timeout=30000")            # wait for other writers, don't fail
             if target != ":memory:":
-                self.conn.execute("PRAGMA journal_mode=WAL")      # readers don't block writers
+                # readers don't block writers. Switching a brand-new file to WAL needs an exclusive
+                # lock that SQLite won't wait for, so retry briefly if another connection is doing it too.
+                _retry_locked(lambda: self.conn.execute("PRAGMA journal_mode=WAL"))
             self.conn.execute("PRAGMA synchronous=NORMAL")
         blob = "BYTEA" if self.dialect == "postgres" else "BLOB"
         real = "DOUBLE PRECISION" if self.dialect == "postgres" else "REAL"
@@ -210,7 +214,15 @@ class BoxDB:
             "event TEXT NOT NULL, detail TEXT NOT NULL, prev TEXT NOT NULL, hash TEXT NOT NULL, "
             "PRIMARY KEY (box_id, seq))",
         ]:
-            self.execute(ddl)
+            _retry_locked(lambda ddl=ddl: self.execute(ddl))
+        if self.dialect == "postgres":
+            self.conn.execute("SELECT pg_advisory_unlock(7428101)")
+
+    def lock(self, key: str) -> None:
+        """Inside a transaction: serialise writers working on the same key (e.g. one box).
+        SQLite transactions already take the write lock up front, so only Postgres needs this."""
+        if self.dialect == "postgres":
+            self.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (key,))
 
     def execute(self, sql: str, params: tuple = ()) -> list[tuple]:
         if self.dialect == "postgres":
@@ -240,13 +252,28 @@ class BoxDB:
         self.conn.close()
 
 
+def _retry_locked(fn: Any, seconds: float = 30.0) -> Any:
+    """Run fn, retrying while SQLite reports the database as locked (setup steps only)."""
+    deadline = time.monotonic() + seconds
+    delay = 0.01
+    while True:
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e) or time.monotonic() > deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
+
+
 class _Tx:
     def __init__(self, db: BoxDB):
         self.db = db
 
     def __enter__(self):
         self.db._lock.acquire()
-        self.db.conn.execute("BEGIN")
+        # SQLite: take the write lock at the start, so two writers can't deadlock upgrading later.
+        self.db.conn.execute("BEGIN IMMEDIATE" if self.db.dialect == "sqlite" else "BEGIN")
         return self.db
 
     def __exit__(self, exc_type, exc, tb):
@@ -318,9 +345,13 @@ class BoxStore:
         else:
             dek = self._lock_vault(AESGCM.generate_key(bit_length=256), f"{box}|dek")
         label = self._lock_vault(holder.encode(), f"{box}|label")
-        self.db.upsert("tv_boxes", ["box_id", "holder_fp", "holder_label", "tier", "wrapped_dek", "created"],
-                       (box, self._mac("holder", holder), label, tier, dek, self.clock()), ["box_id"])
-        self._log(box, "created", {"tier": tier})
+        with self.db.transaction() as db:
+            db.lock(box)
+            if db.execute("SELECT 1 FROM tv_boxes WHERE box_id=?", (box,)):
+                return box                # another writer created it first: keep ITS key, never replace it
+            db.execute("INSERT INTO tv_boxes (box_id, holder_fp, holder_label, tier, wrapped_dek, created) "
+                       "VALUES (?,?,?,?,?,?)", (box, self._mac("holder", holder), label, tier, dek, self.clock()))
+            self._log(box, "created", {"tier": tier}, db=db)
         return box
 
     def _box_dek(self, box: str) -> bytes:
@@ -344,7 +375,8 @@ class BoxStore:
         aad = f"{box}|{item_id}"
         recovery = None
         if tier == "high":
-            assert self.holder_keys is not None
+            if self.holder_keys is None:
+                raise BoxLocked("high-tier boxes need holder keys (holder_keys=...)")
             inner = _seal_to(self.holder_keys.public_key(holder), plain, aad.encode())
             blob = self._lock_vault(inner, aad)
             if self.recovery_public_key:
@@ -461,7 +493,10 @@ class BoxStore:
 
     def recover(self, ref: str, recovery_private_key: bytes) -> Any:
         """Company break-glass: read a high-tier item with the recovery key instead of the holder's."""
-        box, item = REF_RE.match(ref).groups()
+        m = REF_RE.match(ref) if isinstance(ref, str) else None
+        if not m:
+            raise ValueError("not a box reference")
+        box, item = m.groups()
         rows = self.db.execute("SELECT recovery FROM tv_items WHERE box_id=? AND item=?", (box, item))
         if not rows or rows[0][0] is None:
             raise BoxLocked("no recovery copy for this item")
@@ -496,16 +531,21 @@ class BoxStore:
         return out
 
     # --------------------------------------------------------------- logs
-    def _log(self, box: str, event: str, detail: dict[str, Any]) -> None:
-        with self.db.transaction() as db:
-            last = db.execute("SELECT seq, hash FROM tv_box_log WHERE box_id=? ORDER BY seq DESC LIMIT 1", (box,))
-            seq, prev = (last[0][0] + 1, last[0][1]) if last else (0, "0" * 64)
-            ts = round(self.clock(), 3)
-            body = json.dumps({"box": box, "seq": seq, "ts": ts, "event": event, "detail": detail, "prev": prev},
-                              sort_keys=True, default=str)
-            digest = hashlib.sha256(body.encode()).hexdigest()
-            db.execute("INSERT INTO tv_box_log (box_id, seq, ts, event, detail, prev, hash) VALUES (?,?,?,?,?,?,?)",
-                       (box, seq, ts, event, json.dumps(detail, sort_keys=True, default=str), prev, digest))
+    def _log(self, box: str, event: str, detail: dict[str, Any], db: BoxDB | None = None) -> None:
+        """Append to the box's hash-chained log (inside the caller's transaction, or a new one)."""
+        if db is None:
+            with self.db.transaction() as tx:
+                self._log(box, event, detail, db=tx)
+            return
+        db.lock(box)
+        last = db.execute("SELECT seq, hash FROM tv_box_log WHERE box_id=? ORDER BY seq DESC LIMIT 1", (box,))
+        seq, prev = (last[0][0] + 1, last[0][1]) if last else (0, "0" * 64)
+        ts = round(self.clock(), 3)
+        body = json.dumps({"box": box, "seq": seq, "ts": ts, "event": event, "detail": detail, "prev": prev},
+                          sort_keys=True, default=str)
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        db.execute("INSERT INTO tv_box_log (box_id, seq, ts, event, detail, prev, hash) VALUES (?,?,?,?,?,?,?)",
+                   (box, seq, ts, event, json.dumps(detail, sort_keys=True, default=str), prev, digest))
 
     def log(self, box: str) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT seq, ts, event, detail, prev, hash FROM tv_box_log WHERE box_id=? ORDER BY seq",

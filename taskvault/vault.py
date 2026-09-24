@@ -37,7 +37,6 @@ import secrets
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
-from email.utils import getaddresses
 from typing import Any
 
 from .audit import AuditLog
@@ -51,6 +50,7 @@ from .store import SecretStore, is_ref
 log = logging.getLogger("taskvault")
 
 TOKEN_RE = re.compile(r"\[\[vault:([a-z0-9_]+):([a-f0-9]{8})\]\]")
+LOOSE_TOKEN_RE = re.compile(r"\[\[\s*vault\s*:[^\]]*\]\]?", re.I)   # anything that looks like a placeholder
 MIN_MATCH_LEN = 4  # shorter values produce too many false matches
 _NO_RULE = SinkRule()
 
@@ -61,6 +61,10 @@ class Blocked(TaskvaultError):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class SinkError(TaskvaultError):
+    """A sink (your own code) raised an error. The message has real values masked, as the model may see it."""
 
 
 @dataclass(frozen=True)
@@ -190,14 +194,16 @@ class Task:
         """Return one record, filtered to allowed fields, with secrets as placeholders."""
         self._reported = set()
         if source not in self.vault.policy.sources:
-            self._decide("read", f"unknown source {source!r}", source=source)
+            self._decide("read", "unknown source", shown=f"unknown source {source!r}",
+                         source=self.vault.fp(source))
             raise KeyError(f"unknown source {source!r}")
         rule = self.template.reads.get(source)
         allowed_keys = self.allowed_keys(source)
         if key is None and len(allowed_keys) == 1:
             key = allowed_keys[0]
         if rule is None or str(key) not in {str(k) for k in allowed_keys}:
-            self._decide("read", f"{source}:{key} is outside this task's scope",
+            self._decide("read", f"{source} record is outside this task's scope",
+                         shown=f"{source}:{key} is outside this task's scope",
                          source=source, key=self.vault.fp(key))
             rule = {"fields": None}   # shadow mode only: observe what an unscoped read returns
         record = self.vault._fetch(source, key)
@@ -274,7 +280,7 @@ class Task:
         shown = args                                        # what the agent sent (for approvals and replay)
         args = {k: self._unpseudo(v) for k, v in args.items()}   # checks run on real values
         if sink not in self.vault.sinks:
-            self._decide("act", f"unknown sink {sink!r}", sink=sink)
+            self._decide("act", "unknown sink", shown=f"unknown sink {sink!r}", sink=self.vault.fp(sink))
             raise KeyError(f"unknown sink {sink!r}")   # shadow mode: nothing to run
         rule = self.template.sinks.get(sink)
         if rule is None:
@@ -282,21 +288,30 @@ class Task:
             rule = _NO_RULE
 
         if rule.args is not None and (extra := sorted(set(args) - set(rule.args))):
-            self._decide("act", f"{sink!r} does not accept arguments {extra}", sink=sink)
+            self._decide("act", f"{sink!r} does not accept some of the arguments given",
+                         shown=f"{sink!r} does not accept arguments {extra}", sink=sink)
 
         n = self._calls.get(sink, 0) + 1
         if rule.max_calls is not None and n > rule.max_calls:
             self._decide("act", f"{sink!r} called more than {rule.max_calls} times in one task", sink=sink)
 
-        recipients = _as_list(args.get(rule.recipient_arg)) if rule.recipient_arg else []
+        recipient_args = [rule.recipient_arg] if rule.recipient_arg else []
+        if rule.recipient_arg:     # cc, bcc, reply_to... get the same checks as the main recipient
+            recipient_args += [a for a in args if a != rule.recipient_arg and a.lower() in _RECIPIENT_ARGS]
+        recipients = [r for a in recipient_args for r in _as_list(args.get(a))]
         if rule.recipient_arg:
             trusted = self._trusted_recipients(rule.allowed_recipients)
             for r in recipients or [None]:
                 if not _matches(r, trusted):
-                    self._decide("act", f"recipient {r!r} did not come from trusted data",
+                    self._decide("act", "recipient did not come from trusted data",
+                                 shown=f"recipient {r!r} did not come from trusted data",
                                  sink=sink, recipient=self.vault.fp(r))
 
         text = _flatten(args)
+
+        # Something that looks like a placeholder but isn't a valid one: damaged or forged.
+        if any(not TOKEN_RE.fullmatch(m.group(0)) for m in LOOSE_TOKEN_RE.finditer(text)):
+            self._decide("act", "damaged or forged placeholder", sink=sink)
 
         # Placeholders: only sinks allowed to receive that secret, and only for its owner.
         for token in sorted(set(m.group(0) for m in TOKEN_RE.finditer(text))):
@@ -325,8 +340,9 @@ class Task:
                 self._decide("act", f"raw secret {label.field!r} in outbound action", sink=sink)
             for r in recipients:
                 if not self._owner_ok(label, r):
-                    self._decide("act", f"{label.source}.{label.field} (owner {label.owner}) "
-                                        f"may not be sent to this recipient", sink=sink,
+                    self._decide("act", f"{label.source}.{label.field} may not be sent to anyone but its owner",
+                                 shown=f"{label.source}.{label.field} (owner {label.owner}) "
+                                       f"may not be sent to this recipient", sink=sink,
                                  recipient=self.vault.fp(r))
 
         if self.vault.policy.detect_outbound and recipients:
@@ -349,17 +365,34 @@ class Task:
 
         self._calls[sink] = n
         self._sink = sink
+        if self.vault.mode == "enforce":
+            for a in recipient_args:     # the sink gets the checked address, not the text the agent wrote
+                v = args.get(a)
+                if isinstance(v, str) and v.strip():
+                    args[a] = ", ".join(_norm(x) for x in _as_list(v))
+                elif isinstance(v, (list, tuple)):
+                    args[a] = [_norm(x) for x in v]
         try:
             resolved = {k: self._resolve(v) for k, v in args.items()}
         except BoxLocked as e:
             self.vault.audit.record("act", task=self.id, sink=sink, decision="block", reason=f"box locked: {e}")
             raise Blocked(f"box locked: {e}") from e
-        self.vault.audit.record("act", task=self.id, sink=sink, args=sorted(args),
+        except Exception as e:  # noqa: BLE001 - damaged or missing stored secret: fail closed, and log it
+            self.vault.audit.record("act", task=self.id, sink=sink, decision="block",
+                                    reason=f"a stored secret couldn't be unlocked ({type(e).__name__})")
+            raise Blocked("a stored secret couldn't be unlocked; the action was not run") from None
+        self.vault.audit.record("act", task=self.id, sink=sink, args=[self._safe_name(a) for a in sorted(args)],
                                 recipients=[self.vault.fp(r) for r in recipients], recipient_classes=classes,
-                                arg_sizes=sizes, call=n, decision="allow")
+                                arg_sizes={self._safe_name(k): v for k, v in sizes.items()}, call=n,
+                                decision="allow")
         if flags:
             self._flag(sink, flags)
-        result = self.vault.sinks[sink](**resolved)
+        mask = self._mask_map(args, resolved)
+        try:
+            result = self.vault.sinks[sink](**resolved)
+        except Exception as e:  # noqa: BLE001 - the error text may quote real values; mask them
+            raise SinkError(f"{sink} failed: {type(e).__name__}: {_mask(str(e), mask)}") from None
+        result = _mask(result, mask)
         if self.vault.recorder:
             self.vault.recorder.sink_called(sink, shown, result)
         if self.vault.cache is not None:
@@ -373,8 +406,13 @@ class Task:
         arguments = dict(arguments or {})
         tm = self.vault.policy.tools.get(name)
         if tm is None:
-            self._decide("act", f"tool {name!r} is not exposed", tool=name)
+            self._decide("act", "tool is not exposed", shown=f"tool {name!r} is not exposed",
+                         tool=self.vault.fp(name))
             raise Blocked(f"tool {name!r} is not exposed")
+        for arg, kind in (tm.params or {}).items():     # the declared JSON types, checked before anything runs
+            if arg in arguments and not _json_type_ok(arguments[arg], kind):
+                self._decide("act", f"tool argument has the wrong type (expected {kind})",
+                             shown=f"argument {arg!r} of {name!r} must be a {kind}", tool=name)
         if tm.read:
             key = arguments.get(tm.key_arg) if tm.key_arg else None
             return self.read(tm.read, key)
@@ -411,12 +449,14 @@ class Task:
                 if rec and rec.get(m.group(3)):
                     out.extend(_norm(v) for v in _as_list(rec[m.group(3)]))
             else:
-                out.append(_norm(spec))   # literal address or glob like *@acme.example
+                out.append(_norm_pattern(spec))   # literal address or glob like *@acme.example
         return out
 
     def _owner_ok(self, label: Label, recipient: Any) -> bool:
         """Protected data may go to its owner, or to the company's own domains (it already holds it)."""
         r = _norm(recipient)
+        if r in ("", _INVALID):
+            return False
         if "@" in r and r.rsplit("@", 1)[-1] in self.vault.policy.internal_domains:
             return True
         if label.owner == "company":
@@ -457,6 +497,23 @@ class Task:
             return {k: self._unpseudo(v) for k, v in value.items()}
         return value
 
+    def _safe_name(self, name: str) -> str:
+        """Argument names chosen by the agent: kept if they look like names, else fingerprinted."""
+        return name if _NAME_RE.fullmatch(str(name)) else "fp:" + self.vault.fp(name)
+
+    def _mask_map(self, shown: dict[str, Any], resolved: dict[str, Any]) -> dict[str, str]:
+        """Real value -> what the agent saw (placeholder or pseudonym), for masking sink output."""
+        out: dict[str, str] = {}
+        for token in set(m.group(0) for m in TOKEN_RE.finditer(_flatten(shown))):
+            if token in self._tokens:
+                real = str(self._resolve(token))
+                if real and real != token:
+                    out[real] = token
+        for pseudo, real in self._pseudo.items():
+            if str(real):
+                out.setdefault(str(real), pseudo)
+        return out
+
     def _recipient_class(self, recipient: Any, rule: SinkRule) -> str:
         r = _norm(recipient)
         if "@" in r and r.rsplit("@", 1)[-1] in self.vault.policy.internal_domains:
@@ -472,15 +529,21 @@ class Task:
         if self.vault.on_flag:
             self.vault.on_flag(FlagEvent(self.id, self.template.name, sink, reasons))
 
-    def _decide(self, kind: str, reason: str, **fields: Any) -> None:
-        log.info("task %s %s: %s", self.id, "would block" if self.vault.mode == "shadow" else "blocked", reason)
+    def _decide(self, kind: str, reason: str, shown: str | None = None, **fields: Any) -> None:
+        """Block (or, in shadow mode, record) an action.
+
+        `reason` goes to the log and the audit file, so it must never contain data values
+        (addresses, record keys, owners): only names from the policy. `shown` is the fuller
+        message for the caller, who supplied those values in the first place.
+        """
+        log.info("%s %s: %s", "would block" if self.vault.mode == "shadow" else "blocked", kind, reason)
         if self.vault.mode == "shadow":
-            if reason not in self._reported:
-                self._reported.add(reason)
+            if (shown or reason) not in self._reported:
+                self._reported.add(shown or reason)
                 self.vault.audit.record(kind, task=self.id, decision="would_block", reason=reason, **fields)
             return
         self.vault.audit.record(kind, task=self.id, decision="block", reason=reason, **fields)
-        raise Blocked(reason)
+        raise Blocked(shown or reason)
 
 
 def owner_of(src: Any, key: Any, record: dict) -> str:
@@ -491,26 +554,79 @@ def owner_of(src: Any, key: Any, record: dict) -> str:
     return f"{src.owner}:{oid}"
 
 
+_INVALID = "\x00invalid"
+_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_RECIPIENT_ARGS = {"to", "cc", "bcc", "reply_to", "replyto", "reply-to", "recipient", "recipients"}
+
+_ATOM = r"[a-z0-9!#$%&'*+/=?^_`{|}~-]+"
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_EMAIL_RE = re.compile(rf"{_ATOM}(?:\.{_ATOM})*@{_LABEL}(?:\.{_LABEL})+")
+_PLAIN_ID_RE = re.compile(r"[a-z0-9+][a-z0-9+._:/-]*")          # phone numbers, account ids, URLs' paths...
+_DISPLAY_RE = re.compile(r"([^<>@\"\\]*)<([^<>]+)>")
+
+
 def _norm(v: Any) -> str:
-    """Canonical form for comparing recipients: NFKC, trimmed, lower-case, and for an address
-    written as 'Name <addr>' just the address. Anything ambiguous normalises to something that
-    won't match a trusted recipient, so it's blocked rather than guessed."""
-    raw = str(v or "")
-    s = unicodedata.normalize("NFKC", raw).strip()
-    if s != raw.strip() or any(c in s for c in "\r\n\t\x00") or not s.isascii():
-        return "\x00invalid"                 # look-alike characters or header injection
-        return "\x00invalid"                 # header injection attempt
+    """Canonical form for comparing recipients.
+
+    Accepts exactly one plain address ("a@b.com", any case, surrounding spaces) or
+    "Display Name <a@b.com>" with no '@' in the name; or, for non-email recipients, one plain
+    identifier. Anything else (a second address, comments, quoted parts, stray dots, control or
+    invisible characters, look-alike letters, non-text values) normalises to a value that never
+    matches a trusted recipient, so it's blocked rather than guessed.
+    """
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        return _INVALID
+    if any(c in v for c in "\r\n\t\x00") or any(unicodedata.category(c) in ("Cf", "Cc") for c in v):
+        return _INVALID                      # header injection or invisible characters
+    if unicodedata.normalize("NFKC", v) != v or not v.isascii():
+        return _INVALID                      # look-alike characters
+    s = v.strip()
     if "<" in s or ">" in s:
-        parsed = getaddresses([s])
-        if len(parsed) != 1 or not parsed[0][1] or s.count("<") != 1:
-            return "\x00invalid"
-        s = parsed[0][1]
-    return s.strip().strip(".").lower()
+        m = _DISPLAY_RE.fullmatch(s)
+        if not m:
+            return _INVALID
+        s = m.group(2).strip()
+    s = s.lower()
+    if "@" in s:
+        return s if _EMAIL_RE.fullmatch(s) else _INVALID
+    return s if _PLAIN_ID_RE.fullmatch(s) else _INVALID
+
+
+def _json_type_ok(value: Any, kind: str) -> bool:
+    checks = {"string": lambda v: isinstance(v, str),
+              "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+              "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+              "boolean": lambda v: isinstance(v, bool),
+              "array": lambda v: isinstance(v, list), "object": lambda v: isinstance(v, dict)}
+    return checks.get(kind, lambda v: True)(value)
+
+
+def _mask(value: Any, mask: dict[str, str]) -> Any:
+    """Replace real values with what the agent saw, anywhere in a sink's result."""
+    if not mask:
+        return value
+    if isinstance(value, str):
+        for real in sorted(mask, key=len, reverse=True):
+            if len(real) >= 3 and real in value:
+                value = value.replace(real, mask[real])
+        return value
+    if isinstance(value, (list, tuple)):
+        return type(value)(_mask(v, mask) for v in value)
+    if isinstance(value, dict):
+        return {k: _mask(v, mask) for k, v in value.items()}
+    return value
+
+
+def _norm_pattern(spec: str) -> str:
+    """Allowed-recipient patterns from the policy (trusted): just trimmed and lower-cased."""
+    return spec.strip().lower()
 
 
 def _matches(recipient: Any, allowed: list[str]) -> bool:
     r = _norm(recipient)
-    return bool(r) and any(r == a or (any(c in a for c in "*?[") and fnmatch.fnmatchcase(r, a))
+    return bool(r) and r != _INVALID and any(r == a or (any(c in a for c in "*?[") and fnmatch.fnmatchcase(r, a))
                            for a in allowed)
 
 

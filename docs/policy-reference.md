@@ -81,16 +81,18 @@ tasks:
 | `trusted` | Inputs your app must supply to `start_task`. Never derive these from untrusted text |
 | `reads.<source>.key` / `keys` | Which record(s) the task may read. `{name}` is filled from trusted inputs |
 | `reads.<source>.fields` | Which fields are returned. Omit to return all (linter warns) |
-| `sinks.<sink>.recipient_arg` | Argument naming the recipient(s). Lists and comma-separated strings are each checked |
+| `sinks.<sink>.recipient_arg` | Argument naming the recipient(s). Lists and comma-separated strings are each checked. Each must be exactly one plain address (`a@b.com` or `Name <a@b.com>`) or one plain id; anything else is blocked. Arguments named `cc`, `bcc`, `reply_to` or `recipients` get the same checks. The sink receives the checked address |
 | `sinks.<sink>.allowed_recipients` | `source:key.field` (looked up by the vault), a literal address, or a glob like `*@yourcompany.com` |
 | `sinks.<sink>.secrets_allowed` | Secret fields whose placeholders are swapped for real values at this sink. As a mapping (`{card_number: card}`), each secret may only be passed as that one argument |
-| `sinks.<sink>.args` | The only argument names this sink accepts |
+| `sinks.<sink>.args` | The only argument names this sink accepts. Recommended for every sink with a recipient (the linter warns otherwise) |
 | `sinks.<sink>.risk` | `low` (default): allow. `medium`: allow, but flag for review (`on_flag` callback, `taskvault review`). `high`: a human must approve |
 | `sinks.<sink>.approval` | `always` sends every call to your `approver`; `never` (default). Set automatically by `risk: high` |
 | `sinks.<sink>.max_calls` | Per-task limit |
 | `sinks.<sink>.invalidates` | Sources to drop from the cache after this action |
 
 Any source or sink not listed in the task is blocked.
+
+List settings (`allowed_recipients`, `args`, `fields`, `trusted`...) must be written as lists, e.g. `[a, b]`. A plain string is rejected, so a typo can't turn `"*@acme.example"` into "anyone".
 
 ## `tools`
 

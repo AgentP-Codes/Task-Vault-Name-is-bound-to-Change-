@@ -151,18 +151,19 @@ class Planner:
             recipients = rv.value if isinstance(rv.value, list) else [rv.value]
             recipients = [self.task._unpseudo(r) for r in recipients]
             if rv.untrusted:
-                reasons.append(f"recipient for {sink!r} was derived from untrusted content")
+                reasons.append((f"recipient for {sink!r} was derived from untrusted content", None))
         for name, lv in args.items():
             for label in lv.labels:
                 if label.level == "secret" and (not rule or label.field not in rule.secrets_allowed):
-                    reasons.append(f"argument {name!r} carries secret {label.source}.{label.field}")
+                    reasons.append((f"argument {name!r} carries secret {label.source}.{label.field}", None))
                 if label.level in ("protected", "secret"):
                     for r in recipients:
                         if not self.task._owner_ok(label, r):
-                            reasons.append(f"argument {name!r} carries {label.source}.{label.field} "
-                                           f"(owner {label.owner}) to a recipient who isn't its owner")
-        for reason in dict.fromkeys(reasons):
-            self.task._decide("act", "provenance: " + reason, sink=sink)
+                            safe = (f"argument {name!r} carries {label.source}.{label.field} "
+                                    "to a recipient who isn't its owner")
+                            reasons.append((safe, safe.replace(" to a", f" (owner {label.owner}) to a")))
+        for reason, shown in dict.fromkeys(reasons):
+            self.task._decide("act", "provenance: " + reason, shown=shown and "provenance: " + shown, sink=sink)
         # Then the ordinary checks (trusted recipients, value matching, approvals) and execution.
         return self.task.act(sink, **{k: v.value for k, v in args.items()})
 

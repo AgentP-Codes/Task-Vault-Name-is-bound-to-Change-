@@ -82,7 +82,8 @@ def test_secrets_can_live_in_the_vault_instead_of_your_database(cipher, tmp_path
                          owner_field="customer_id")
     for r in rows:
         world.customers[r["customer_id"]] = r               # the "database" now holds references only
-    assert is_ref(world.customers[12]["card_number"]) and b"4111" not in (tmp_path / "secrets.db").read_bytes()
+    assert is_ref(world.customers[12]["card_number"])
+    assert b"4111 1111 1111 1111" not in (tmp_path / "secrets.db").read_bytes()
 
     t = _vault(world, cipher=cipher, store=store).start_task("support_reply", customer_id=12)
     c = t.read("crm.customer")
@@ -213,5 +214,5 @@ def test_cli_baseline_review_and_store(tmp_path, capsys):
                  "--owner-field", "id", "--owner-name", "customer_id", "--key", str(tmp_path / "k.key"),
                  "--store", str(tmp_path / "s.db"), "--out", str(tmp_path / "out.csv")]) == 0
     out = (tmp_path / "out.csv").read_text()
-    assert "4111" not in out and "tvref_" in out
+    assert "4111 1111 1111 1111" not in out and "tvref_" in out
     assert oct((tmp_path / "s.db").stat().st_mode)[-3:] == "600"

@@ -107,6 +107,21 @@ class Policy:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Policy:
+        """Build a policy, rejecting anything of the wrong shape with a PolicyError that says where."""
+        try:
+            return cls._from_dict(raw)
+        except PolicyError:
+            raise
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
+            raise PolicyError(f"the policy has a value of the wrong type or shape ({type(e).__name__}: {e})") from e
+
+    @classmethod
+    def _from_dict(cls, raw: dict[str, Any]) -> Policy:
+        if not isinstance(raw, dict):
+            raise PolicyError("a policy must be a mapping (key: value), not a list or a single value")
+        for section in ("sources", "tasks", "tools", "upstream"):
+            _mapping(raw.get(section), section, entries=section != "upstream")
+        _str_list(raw.get("internal_domains"), "internal_domains")
         known = {"sources", "tasks", "tools", "internal_domains", "cache_ttl_seconds", "version", "upstream",
                  "detect_outbound"}
         if extra := set(raw) - known:
@@ -115,6 +130,10 @@ class Policy:
         sources: dict[str, Source] = {}
         for name, s in (raw.get("sources") or {}).items():
             s = s or {}
+            _str_list(s.get("pseudonymize"), f"source {name}: pseudonymize")
+            _mapping(s.get("fields"), f"source {name}: fields")
+            _mapping(s.get("key_levels"), f"source {name}: key_levels")
+            _mapping(s.get("label_map"), f"source {name}: label_map")
             _only(s, {"owner", "owner_contact", "owner_field", "fields", "key_levels",
                           "default_level", "trust", "label_field", "label_map", "pseudonymize", "storage"},
                   f"source {name}")
@@ -148,16 +167,38 @@ class Policy:
         for name, t in (raw.get("tasks") or {}).items():
             t = t or {}
             _only(t, {"trusted", "reads", "sinks", "description"}, f"task {name}")
+            _str_list(t.get("trusted"), f"task {name}: trusted")
+            _mapping(t.get("reads"), f"task {name}: reads", entries=True)
+            _mapping(t.get("sinks"), f"task {name}: sinks", entries=True)
             reads = t.get("reads") or {}
             for src, rule in reads.items():
                 if src not in sources:
                     raise PolicyError(f"task {name}: unknown source {src!r}")
                 _only(rule or {}, {"key", "keys", "fields"}, f"task {name} read {src}")
+                _str_list((rule or {}).get("fields"), f"task {name} read {src}: fields")
+                if "keys" in (rule or {}) and not isinstance(rule["keys"], list):
+                    raise PolicyError(f"task {name} read {src}: keys must be a list, e.g. [a, b]")
             sinks = {}
             for sink, rule in (t.get("sinks") or {}).items():
                 rule = rule or {}
                 _only(rule, set(SinkRule.__dataclass_fields__), f"task {name} sink {sink}")
+                where = f"task {name} sink {sink}"
+                for key in ("allowed_recipients", "args", "invalidates"):
+                    _str_list(rule.get(key), f"{where}: {key}", none_ok=key == "args")
+                sa = rule.get("secrets_allowed")
+                if sa is not None and not isinstance(sa, dict):
+                    _str_list(sa, f"{where}: secrets_allowed")
+                if rule.get("max_calls") is not None and (not isinstance(rule["max_calls"], int)
+                                                          or isinstance(rule["max_calls"], bool)
+                                                          or rule["max_calls"] < 0):
+                    raise PolicyError(f"{where}: max_calls must be a whole number")
+                if rule.get("recipient_arg") is not None and not isinstance(rule["recipient_arg"], str):
+                    raise PolicyError(f"{where}: recipient_arg must be an argument name")
                 sr = SinkRule(**rule)
+                sr.allowed_recipients = list(sr.allowed_recipients or [])     # empty means nobody
+                sr.invalidates = list(sr.invalidates or [])
+                if sr.secrets_allowed is None:
+                    sr.secrets_allowed = []
                 if sr.approval not in ("never", "always"):
                     raise PolicyError(f"task {name} sink {sink}: approval must be never|always")
                 if sr.risk not in ("low", "medium", "high"):
@@ -201,3 +242,27 @@ class Policy:
 def _only(d: dict, allowed: set[str], where: str) -> None:
     if extra := set(d) - allowed:
         raise PolicyError(f"{where}: unknown keys {sorted(extra)}")
+
+
+def _mapping(v: Any, where: str, entries: bool = False) -> None:
+    """None or a mapping; with entries=True, each value must be a mapping (or empty) too."""
+    if v is None:
+        return
+    if not isinstance(v, dict):
+        raise PolicyError(f"{where} must be a mapping (name: settings)")
+    if entries:
+        for k, item in v.items():
+            if item is not None and not isinstance(item, dict):
+                raise PolicyError(f"{where}: {k} must be a mapping (settings), not {type(item).__name__}")
+
+
+def _str_list(v: Any, where: str, none_ok: bool = True) -> None:
+    """A list of plain values. A bare string is rejected: iterating it would mean single characters
+    (e.g. "*@acme.example" would contain '*', which allows every recipient)."""
+    if v is None:
+        return
+    if not isinstance(v, list):
+        raise PolicyError(f"{where} must be a list, e.g. [a, b] (got {type(v).__name__})")
+    for item in v:
+        if not isinstance(item, (str, int, float)) or isinstance(item, bool):
+            raise PolicyError(f"{where}: list items must be plain values, not {type(item).__name__}")

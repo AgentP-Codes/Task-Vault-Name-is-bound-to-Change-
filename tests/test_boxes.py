@@ -48,7 +48,7 @@ def test_normal_fields_open_with_the_vault_key_high_fields_stay_locked(db_url, v
     assert placed["card_number"] == "high" and placed["email"] == "normal"
     rec = store.fetch_record("crm.customer", 12)
     assert rec["email"] == "priya.shah@example.com" and rec["plan"] == "Pro"
-    assert is_box_ref(rec["card_number"]) and "4111" not in json.dumps(rec)
+    assert is_box_ref(rec["card_number"]) and "4111 1111 1111 1111" not in json.dumps(rec)
 
 
 def test_high_box_needs_both_keys(db_url, vault_keys):
@@ -142,7 +142,9 @@ def test_database_holds_no_readable_values(tmp_path, vault_keys):
     _load_customers(store)
     store.db.close()
     raw = b"".join(p.read_bytes() for p in tmp_path.glob("boxes.db*"))
-    for secret in [b"Priya", b"priya.shah", b"4111", b"customer:12", b"card_number"]:
+    # Full values only: the database holds hex ids and hashes, which can contain short digit runs by chance.
+    for secret in [b"Priya", b"priya.shah", b"4111 1111 1111 1111", b"4111111111111111", b"Parramatta",
+                   b"customer:12", b"card_number"]:
         assert secret not in raw
 
 
@@ -235,3 +237,32 @@ def test_boxes_cli_end_to_end(tmp_path, capsys):
     assert "log chain valid" in capsys.readouterr().out
     assert main(["boxes", "forget", *common, "--holder", "customer:12"]) == 0
     assert "deleted 4 items" in capsys.readouterr().out   # all 4 fields of the record
+
+
+# ---- concurrency (found by the stress test) --------------------------------------------------
+
+def test_concurrent_writers_lose_nothing_and_every_value_reads_back(db_url, vault_keys):
+    """Several connections depositing into the same holders' boxes at once: no 'database is
+    locked' errors, no box key replaced mid-flight, every value decrypts afterwards."""
+    from concurrent.futures import ThreadPoolExecutor
+    errors = []
+
+    def worker(w):
+        try:
+            store = BoxStore(BoxDB(db_url), vault_keys)          # its own connection, like another process
+            for i in range(25):
+                store.deposit(f"customer:{i % 3}", "normal", f"w{w}-f{i}", f"value {w}-{i}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    with ThreadPoolExecutor(8) as ex:
+        list(ex.map(worker, range(8)))
+    assert errors == []
+    store = BoxStore(BoxDB(db_url), vault_keys)
+    for w in range(8):
+        for i in range(25):
+            box = store.box_id(f"customer:{i % 3}", "normal")
+            item = store._mac("item", box, f"w{w}-f{i}")[:24]
+            assert store._read_normal(box, item, None) == f"value {w}-{i}"
+    for h in range(3):
+        assert store.verify_log(store.box_id(f"customer:{h}", "normal"))

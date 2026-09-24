@@ -97,10 +97,10 @@ def test_placeholders_are_sealed_and_audit_uses_keyed_fingerprints(cipher):
     task = vault.start_task("support_reply", customer_id=12)
     c = task.read("crm.customer")
     sealed = task._tokens[c["card_number"]][0]
-    assert isinstance(sealed, bytes) and b"4111" not in sealed
+    assert isinstance(sealed, bytes) and b"4111 1111 1111 1111" not in sealed
     task.act("payments.refund", card=c["card_number"], amount=10)
     assert world.refunds[0]["card"] == "4111 1111 1111 1111"
-    assert "4111" not in json.dumps(vault.audit.entries)
+    assert "4111 1111 1111 1111" not in json.dumps(vault.audit.entries)
 
 
 # ---- approvals, limits, globs ----------------------------------------------
@@ -148,3 +148,26 @@ def test_approval_required_fails_closed_without_an_approver():
     ok = _raw_vault(world, approver=lambda req: seen.append(req) or True).start_task("t")
     ok.act("payments.refund", card="x", amount=1)
     assert seen[0].sink == "payments.refund" and world.refunds
+
+
+def _audit_writer(path, n):
+    from taskvault.audit import AuditLog
+    log = AuditLog(path)
+    for i in range(n):
+        log.record("act", i=i, pid=__import__("os").getpid())
+
+
+def test_several_processes_can_share_one_audit_file(tmp_path):
+    """Found by the stress test: separate processes appending to one file must keep one valid chain."""
+    import multiprocessing as mp
+
+    from taskvault.audit import AuditLog
+    path = str(tmp_path / "shared.jsonl")
+    procs = [mp.get_context("spawn").Process(target=_audit_writer, args=(path, 150)) for _ in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+        assert p.exitcode == 0
+    log = AuditLog(path)
+    assert len(log.entries) == 600 and log.verify(), log.first_bad_entry()

@@ -20,6 +20,7 @@ host's `initialize` request under `params._meta.taskvault.trusted`.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 import threading
@@ -27,7 +28,10 @@ from collections.abc import Callable
 from typing import IO, Any
 
 from . import __version__
+from .errors import TaskvaultError
 from .vault import Blocked, Task, Vault
+
+log = logging.getLogger("taskvault.mcp")
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -133,14 +137,32 @@ class ProxyServer:
         self.vault, self.template, self.trusted = vault, template, dict(trusted or {})
         self.task: Task | None = None
 
-    def handle(self, msg: dict[str, Any]) -> dict[str, Any] | None:
+    def handle(self, msg: Any) -> dict[str, Any] | None:
+        """Answer one JSON-RPC message. Never raises: bad input gets an error reply."""
+        if not isinstance(msg, dict):
+            return _error(None, -32600, "invalid request: expected a JSON object")
         method, rid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+        if not isinstance(rid, (str, int, type(None))) or isinstance(rid, bool):
+            rid = None
         if method is None:
             return None                      # a response to something we never send
+        if not isinstance(method, str) or not isinstance(params, dict):
+            return _error(rid, -32600, "invalid request: 'method' must be a string and 'params' an object")
+        try:
+            return self._handle(method, rid, params)
+        except Exception as e:  # noqa: BLE001 - the proxy must stay up; log the type, not the details
+            log.warning("internal error handling %s: %s", method[:40], type(e).__name__)
+            return _error(rid, -32603, f"internal error ({type(e).__name__})")
+
+    def _handle(self, method: str, rid: Any, params: dict[str, Any]) -> dict[str, Any] | None:
         try:
             if method == "initialize":
-                meta = ((params.get("_meta") or {}).get("taskvault") or {}).get("trusted") or {}
-                self.trusted.update(meta)
+                meta = params.get("_meta") or {}
+                meta = meta.get("taskvault") if isinstance(meta, dict) else None
+                meta = meta.get("trusted") if isinstance(meta, dict) else None
+                if meta is not None and not isinstance(meta, dict):
+                    raise ValueError("_meta.taskvault.trusted must be an object")
+                self.trusted.update(meta or {})
                 self.task = self.vault.start_task(self.template, **self.trusted)
                 result: Any = {"protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION),
                                "capabilities": {"tools": {"listChanged": False}},
@@ -153,7 +175,10 @@ class ProxyServer:
                 result = {"tools": [{"name": s["name"], "description": s["description"],
                                      "inputSchema": s["input_schema"]} for s in self._task().tool_specs()]}
             elif method == "tools/call":
-                result = self._call(params.get("name", ""), params.get("arguments") or {})
+                name, arguments = params.get("name", ""), params.get("arguments") or {}
+                if not isinstance(name, str) or not isinstance(arguments, dict):
+                    raise ValueError("tools/call needs a string 'name' and an object 'arguments'")
+                result = self._call(name, arguments)
             elif method.startswith("notifications/"):
                 return None
             elif method in ("resources/list", "prompts/list"):
@@ -176,6 +201,8 @@ class ProxyServer:
             return {"isError": True, "content": [{"type": "text", "text": f"Blocked by taskvault: {e.reason}"}]}
         except (KeyError, MCPError) as e:
             return {"isError": True, "content": [{"type": "text", "text": f"Not available: {e}"}]}
+        except TaskvaultError as e:          # e.g. the tool itself failed (message already masked)
+            return {"isError": True, "content": [{"type": "text", "text": str(e)}]}
         text = value if isinstance(value, str) else json.dumps(value, default=str)
         return {"content": [{"type": "text", "text": text}]}
 
@@ -186,7 +213,7 @@ class ProxyServer:
                 continue
             try:
                 msg = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 reply: dict[str, Any] | None = _error(None, -32700, "parse error")
             else:
                 reply = self.handle(msg)

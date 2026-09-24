@@ -4,7 +4,9 @@ Each entry stores the SHA-256 of the previous entry, so editing, reordering or
 deleting any line breaks the chain and `verify()` fails. Raw sensitive values
 are never written: only field names, keyed fingerprints and decisions.
 
-The file is created with owner-only permissions and appended to under a lock.
+The file is created with owner-only permissions and appended to under a lock. The lock is an
+operating-system file lock, so several processes (e.g. web-server workers) can share one file:
+each entry chains from whatever entry is really last in the file.
 Set `fsync=True` to force each entry to disk before the action runs (slower,
 but nothing is lost if the machine crashes). Ship the file to your SIEM or
 write-once storage for stronger guarantees: a chain proves order and integrity,
@@ -57,7 +59,9 @@ class AuditLog:
                 try:
                     self.entries.append(json.loads(line))
                 except json.JSONDecodeError as e:
-                    raise AuditError(f"{self.path}:{n} is not valid JSON; the log may be damaged") from e
+                    hint = (" If the machine crashed while writing, run `taskvault audit repair` to set the "
+                            "unfinished last line aside." if n == len(self.path.read_text().splitlines()) else "")
+                    raise AuditError(f"{self.path}:{n} is not valid JSON; the log may be damaged.{hint}") from e
 
     @property
     def head(self) -> str:
@@ -65,30 +69,118 @@ class AuditLog:
 
     def record(self, event: str, **fields: Any) -> dict[str, Any]:
         with self._lock:
-            entry = {"seq": len(self.entries), "ts": round(time.time(), 3), "event": event,
-                     **fields, "prev": self.head}
-            entry["hash"] = _digest(entry)
-            if self.path:
-                with self.path.open("a") as f:
-                    f.write(json.dumps(entry, sort_keys=True, default=str) + "\n")
-                    if self.fsync:
-                        f.flush()
-                        os.fsync(f.fileno())
+            if not self.path:
+                entry = {"seq": len(self.entries), "ts": round(time.time(), 3), "event": event,
+                         **fields, "prev": self.head}
+                entry["hash"] = _digest(entry)
+                self.entries.append(entry)
+                return entry
+            with self.path.open("a+b") as f, _file_lock(f):
+                last = _last_line(f)                      # another process may have written since
+                seq, prev = (last["seq"] + 1, last["hash"]) if last else (0, GENESIS)
+                entry = {"seq": seq, "ts": round(time.time(), 3), "event": event, **fields, "prev": prev}
+                entry["hash"] = _digest(entry)
+                f.seek(0, os.SEEK_END)
+                f.write((json.dumps(entry, sort_keys=True, default=str) + "\n").encode())
+                f.flush()
+                if self.fsync:
+                    os.fsync(f.fileno())
             self.entries.append(entry)
             return entry
 
     def verify(self) -> bool:
+        """True if the whole chain is intact. With several writers, verify a freshly loaded log
+        (`AuditLog(path).verify()`): this object only holds the entries it wrote itself."""
         return self.first_bad_entry() is None
 
     def first_bad_entry(self) -> int | None:
         """Index of the first entry that breaks the chain, or None if it's intact."""
+        # With a file, check the file itself: other processes may have added entries between ours.
+        entries = AuditLog(self.path).entries if self.path else self.entries
         prev = GENESIS
-        for i, entry in enumerate(self.entries):
+        for i, entry in enumerate(entries):
             body = {k: v for k, v in entry.items() if k != "hash"}
             if entry.get("seq") != i or entry.get("prev") != prev or _digest(body) != entry.get("hash"):
                 return i
             prev = entry["hash"]
         return None
 
+    @staticmethod
+    def repair(path: str | Path) -> Path | None:
+        """Set aside an unfinished LAST line (left by a crash mid-write) so the log can be used again.
+
+        Only the final line is ever moved, into `<file>.torn-<time>`; damage anywhere else is left
+        alone, because that isn't what a crash looks like. Returns the side file, or None.
+        """
+        path = Path(path)
+        data = path.read_bytes()
+        body, sep, tail = data.rstrip(b"\n").rpartition(b"\n")
+        last = tail if sep else data.rstrip(b"\n")
+        try:
+            json.loads(last)
+            AuditLog(path)                                # raises if the damage is anywhere else
+            return None                                   # last line is fine: nothing to repair
+        except json.JSONDecodeError:
+            pass
+        side = path.with_name(f"{path.name}.torn-{int(time.time())}")
+        side.write_bytes(last)
+        with path.open("r+b") as f:
+            f.truncate(len(body) + len(sep) if sep else 0)
+        AuditLog(path)                                    # the rest must now load cleanly
+        return side
+
     def decisions(self, decision: str) -> list[dict[str, Any]]:
         return [e for e in self.entries if e.get("decision") == decision]
+
+
+def _last_line(f) -> dict[str, Any] | None:
+    """The last complete entry in an open binary file, reading backwards from the end."""
+    f.seek(0, os.SEEK_END)
+    end = f.tell()
+    if end == 0:
+        return None
+    chunk, pos, data = 65536, end, b""
+    while pos > 0:
+        step = min(chunk, pos)
+        pos -= step
+        f.seek(pos)
+        data = f.read(step) + data
+        lines = data.rstrip(b"\n").split(b"\n")
+        if len(lines) > 1 or pos == 0:
+            try:
+                return json.loads(lines[-1])
+            except json.JSONDecodeError as e:
+                raise AuditError(f"the last line of {f.name} is not valid JSON; the log may be damaged") from e
+    return None
+
+
+class _file_lock:
+    """Exclusive OS-level lock on an open file, across processes (POSIX flock / Windows locking)."""
+
+    def __init__(self, f):
+        self.f = f
+
+    def __enter__(self):
+        if os.name == "nt":  # pragma: no cover - exercised on Windows only
+            import msvcrt
+            self.f.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        if os.name == "nt":  # pragma: no cover
+            import msvcrt
+            self.f.seek(0)
+            msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+        return False

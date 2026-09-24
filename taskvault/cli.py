@@ -30,6 +30,7 @@ from typing import Any
 
 from . import __version__
 from .audit import AuditLog
+from .errors import TaskvaultError
 from .policy import Policy, PolicyError
 
 DEFAULT_POLICY = "taskvault.yaml"
@@ -151,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--retention-days", type=float, default=30)
 
     s = sub.add_parser("audit", help="verify or read an audit log")
-    s.add_argument("action", choices=["verify", "show"])
+    s.add_argument("action", choices=["verify", "show", "repair"])
     s.add_argument("file")
     s.add_argument("--decision", default=None)
 
@@ -167,6 +168,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except FileNotFoundError as e:
         print(f"not found: {e.filename}", file=sys.stderr)
+        return 2
+    except TaskvaultError as e:
+        print(f"error: {e}", file=sys.stderr)
         return 2
 
 
@@ -466,6 +470,11 @@ def cmd_traces(a: argparse.Namespace) -> int:
 
 
 def cmd_audit(a: argparse.Namespace) -> int:
+    if a.action == "repair":
+        side = AuditLog.repair(a.file)
+        print(f"moved an unfinished last line to {side}; the log is usable again" if side
+              else f"{a.file}: nothing to repair")
+        return 0
     log = AuditLog(a.file)
     if a.action == "verify":
         ok = log.verify()

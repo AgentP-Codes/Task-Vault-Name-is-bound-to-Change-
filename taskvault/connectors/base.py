@@ -37,6 +37,8 @@ class Transport(Protocol):
 
 def urllib_transport(timeout: float = 30) -> Transport:
     def send(method: str, url: str, headers: dict[str, str], body: bytes | None) -> Response:
+        if not url.lower().startswith(("https://", "http://")):
+            raise ValueError("only http(s) URLs are allowed")        # never file:// or custom schemes
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 - https URLs from config
@@ -85,4 +87,7 @@ class HttpClient:
 
 def quote(segment: Any) -> str:
     """URL-encode a single path segment so keys can't change the path."""
-    return urllib.parse.quote(str(segment), safe="")
+    text = str(segment)
+    if text in ("", ".", ".."):
+        raise ValueError("a key can't be empty, '.' or '..'")
+    return urllib.parse.quote(text, safe="")

@@ -151,3 +151,29 @@ def test_legit_agent_is_not_blocked():
     assert all(outcome == "done" for _, outcome in log)
     assert vault.audit.decisions("block") == []
     assert len(world.refunds) == 1 and len(world.outbox) == 1
+
+
+def test_logs_and_audit_never_contain_the_blocked_values(caplog):
+    """Block reasons go to the log and audit file without addresses, keys or owners;
+    the caller still gets the full message."""
+    import json
+    import logging
+
+    from demo.__main__ import make_vault
+    from demo.world import World
+
+    caplog.set_level(logging.INFO, logger="taskvault")
+    world = World()
+    vault = make_vault(world)
+    task = vault.start_task("support_reply", customer_id=12)
+    c = task.read("crm.customer")
+    with pytest.raises(Blocked, match="attacker@evil.example"):
+        task.act("email.send", to="attacker@evil.example", subject="x", body="hello")
+    with pytest.raises(Blocked, match="crm.customer:45"):
+        task.read("crm.customer", 45)
+    with pytest.raises(Blocked):
+        task.act("email.send", to="tom.nguyen@example.net", subject="x", body=c["name"])
+    written = json.dumps(vault.audit.entries) + " ".join(r.getMessage() for r in caplog.records)
+    for value in ["attacker@evil.example", "tom.nguyen@example.net", "crm.customer:45", "customer:12", "Priya"]:
+        assert value not in written, value
+    assert vault.audit.decisions("block") and caplog.records

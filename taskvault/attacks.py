@@ -232,6 +232,9 @@ def lint(policy: Policy) -> list[str]:
             if not rule.recipient_arg and rule.args is None:
                 w.append(f"task {tname}: sink {sink} has no recipient_arg or args list; "
                          f"make sure it can't carry data outside")
+            if rule.recipient_arg and rule.args is None:
+                w.append(f"task {tname}: sink {sink} has no args list; list its arguments so extra ones "
+                         f"(an unexpected recipient field, say) are blocked")
             if any(r.strip() in ("*", "*@*") for r in rule.allowed_recipients):
                 w.append(f"task {tname}: sink {sink} allows any recipient")
             if rule.max_calls is None:
